@@ -16,19 +16,35 @@ jobs:
   core-tests:
     name: Core unit tests (Linux, sanitizers)
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: SOURCE/repo/EarShot/EarShot/tests
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate core tests
+        id: locate
+        shell: bash
+        run: |
+          file=$(find . -name core_test.cpp -path '*EarShot/EarShot/tests/*' -not -path './.git/*' | head -n 1)
+          if [ -z "$file" ]; then
+            echo "::error::tests/core_test.cpp was not found in the repository."
+            echo "Expected SOURCE/repo/EarShot/EarShot/tests/core_test.cpp relative to the repository root."
+            echo "Repository tree (first 200 entries):"
+            find . -not -path './.git*' | sort | head -n 200
+            exit 1
+          fi
+          echo "dir=$(dirname "$file")" >> "$GITHUB_OUTPUT"
+          echo "Found tests in $(dirname "$file")"
+
       - name: Build tests
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -g \
             -fsanitize=address,undefined -fno-sanitize-recover=all \
             core_test.cpp -o core_test
 
       - name: Run tests
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: ./core_test
 
   # Builds the GTA San Andreas ASI (Win32, Release) with MSBuild.
@@ -40,6 +56,15 @@ jobs:
       PLUGIN_SDK_DIR: ${{ github.workspace }}\plugin-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check project files
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'SOURCE\repo\EarShot\EarShot.sln')) {
+            Write-Error 'SOURCE\repo\EarShot\EarShot.sln not found. The repository root must contain the SOURCE folder.'
+            Get-ChildItem -Recurse -Depth 3 | Select-Object -ExpandProperty FullName
+            exit 1
+          }
 
       - name: Fetch Plugin-SDK
         shell: pwsh
