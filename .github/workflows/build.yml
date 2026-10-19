@@ -102,8 +102,14 @@ jobs:
           # installed v1xx toolset instead and warn: that build will not run on Windows XP.
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
-          $toolsets = Get-ChildItem (Join-Path $vsPath 'MSBuild\Microsoft\VC\v*\Platforms\Win32\PlatformToolsets') -Directory -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty Name
+          if (-not $vsPath) { throw 'vswhere found no Visual Studio installation.' }
+
+          # Layout: <VS>\MSBuild\Microsoft\VC\vNNN\Platforms\Win32\PlatformToolsets\<toolset>
+          $toolsets = Get-ChildItem (Join-Path $vsPath 'MSBuild\Microsoft\VC') -Directory -Filter 'v*' |
+            ForEach-Object { Join-Path $_.FullName 'Platforms\Win32\PlatformToolsets' } |
+            Where-Object { Test-Path $_ } |
+            ForEach-Object { Get-ChildItem $_ -Directory } |
+            Select-Object -ExpandProperty Name | Sort-Object -Unique
           $toolsets | ForEach-Object { "Available toolset: $_" } | Write-Host
 
           if ($toolsets -contains 'v141_xp') {
