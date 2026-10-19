@@ -19,7 +19,7 @@ Re-EarShot — это переработанная версия оригинал
 
 Вы можете использовать собственные WAV-файлы или скачать готовый набор звуков:
 
-**[Скачать готовый пак звуков Re-EarShot(на основе NextGen Weapon Sounds)](https://www.mediafire.com/file/2to3v3ddnzl2zpk/Re-Earshot.rar/file)**
+**[Скачать готовый пак звуков Re-EarShot(на основе NextGen Weapon Sounds)](https://www.mediafire.com/file/0tfyhvnquk33tqu/Re-Earshot.rar/file)**
 
 Чтобы установить набор звуков:
 
@@ -91,7 +91,7 @@ The project focuses on improving the original code, fixing bugs, improving memor
 
 You can use your own WAV files or download the ready-made sound pack:
 
-**[Download the Re-EarShot sound pack (based on NextGen Weapon Sounds)](https://www.mediafire.com/file/2to3v3ddnzl2zpk/Re-Earshot.rar/file)**
+**[Download the Re-EarShot sound pack (based on NextGen Weapon Sounds)](https://www.mediafire.com/file/0tfyhvnquk33tqu/Re-Earshot.rar/file)**
 
 To install a sound pack:
 
