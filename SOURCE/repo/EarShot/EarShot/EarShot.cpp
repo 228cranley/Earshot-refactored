@@ -1,390 +1,457 @@
 #include "plugin.h"
-//>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
 #include "CModelInfo.h"
 #include "CCamera.h"
 #include "CAEAudioHardware.h"
-#include <map>
 #include "CTimer.h"
-#include "include/irrKlang-1.6.0/include/irrKlang.h"
 #include "CMenuManager.h"
+#include "CAEPedAudioEntity.h"
+#include "include/irrKlang-1.6.0/include/irrKlang.h"
 #define SUBHOOK_STATIC
 #include "include/subhook-0.8.2/subhook.h"
-#include "CAEPedAudioEntity.h"
-//<
 
 using namespace plugin;
-//>
-using namespace std;
-namespace fs = filesystem;
+namespace fs = std::filesystem;
 
-auto modname = string("EarShot");
-auto modMessage(string messagetext, UINT messageflags = MB_OK) {
-	return MessageBox(GetActiveWindow(), messagetext.c_str(), modname.c_str(), messageflags);
-}
-auto modextension = string(".earshot");
+namespace {
 
-auto caseLower(string casedstring) {
-	auto caselessstring = string();
-	for (auto casedcharacter : casedstring) {
-		if (
-				casedcharacter >= 'A'
-			&&	casedcharacter <= 'Z'
-			) {
-			casedcharacter = tolower(casedcharacter);
-		}
-		caselessstring += casedcharacter;
-	}
-	return caselessstring;
-}
-auto caseUpper(string casedstring) {
-	auto caselessstring = string();
-	for (auto casedcharacter : casedstring) {
-		if (
-			casedcharacter >= 'a'
-			&&	casedcharacter <= 'z'
-			) {
-			casedcharacter = toupper(casedcharacter);
-		}
-		caselessstring += casedcharacter;
-	}
-	return caselessstring;
-}
+const std::string kModName = "EarShot";
+const std::string kModExtension = ".earshot";
+constexpr float kMaxDistance = 150.0f;
+constexpr int kModelUndefined = -1;
 
-auto audiosplaying = vector<pair<irrklang::ISound *, CPhysical *>>();
+static fs::path gameRoot = fs::path(GAME_PATH(""));
+static fs::path modFolder = fs::path(PLUGIN_PATH("")) / kModName;
+static fs::path dataFolder = gameRoot / "data" / kModName;
 
-auto audioengine = (irrklang::ISoundEngine *)nullptr;
+static irrklang::ISoundEngine* audioEngine = nullptr;
+static CVector* cameraPosition = nullptr;
+static std::fstream logFile;
+static int initializationStatus = -2;
 
-auto cameraposition = (CVector *)nullptr;
-auto audioState(irrklang::ISound *audiostream, CPhysical *audioentity) {
-	if (audioentity) {
-		auto audioposition = &audioentity->GetPosition();
-		audiostream->setPosition(irrklang::vec3df(audioposition->x, audioposition->y, audioposition->z));
-	}
+struct PlayingAudio {
+    irrklang::ISound* sound = nullptr;
+};
+static std::vector<PlayingAudio> playingSounds;
 
-	auto audiovolume = AEAudioHardware.m_fEffectMasterScalingFactor;
 
-	auto audiolocation = &audiostream->getPosition();
-	auto audiodistance = CVector(
-			cameraposition->x - audiolocation->X
-		,	cameraposition->y - audiolocation->Y
-		,	cameraposition->z - audiolocation->Z
-	).Magnitude();
-	audiodistance = clamp<float>(audiodistance, 0.0f, 150.0f);
-	auto audiofactor = (150.0f - audiodistance) / 150.0f;
-	audiofactor = pow(audiofactor, 6.0f);
-	audiovolume *= audiofactor;
+static subhook_t hookWeaponFire = nullptr;
+static subhook_t hookWeaponReload = nullptr;
+static subhook_t hookPedHit = nullptr;
+static subhook_t hookPedSwing = nullptr;
 
-	audiostream->setVolume(audiovolume);
+#define LOG_LINE logFile << "\t" <<
+#define LOG_SEPARATOR << " : " <<
+#define LOG_NEWLINE << '\n'
 
-	audiostream->setPlaybackSpeed(CTimer::GetIsSlowMotionActive() ? 0.5f : 1.0f);
+static void showMessage(const std::string& text, UINT flags = MB_OK) {
+    MessageBoxA(GetActiveWindow(), text.c_str(), kModName.c_str(), flags);
 }
 
-auto folderroot = fs::path(GAME_PATH(""));
-auto foldermod = fs::path(PLUGIN_PATH("")) / fs::path(modname);
-auto folderdata = folderroot / fs::path("data") / fs::path(modname);
-
-auto rootlength = folderroot.string().length();
-auto outputPath(fs::path *filepath) {
-	return (filepath->string().erase(0, rootlength));
+static std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
 }
 
-auto AudioPlay(fs::path *audiopath, CPhysical *audioentity) {
-	auto audiostream = audioengine->play3D(audiopath->string().c_str(), irrklang::vec3df(0.0f, 0.0f, 0.0f), false, true);
-	if (!audiostream) {
-		modMessage("Could not play " + outputPath(audiopath));
-
-		return;
-	}
-
-	audiostream->setMinDistance(150.0f);
-	audioState(audiostream, audioentity);
-
-	audiostream->setIsPaused(false);
-
-	audiosplaying.push_back(make_pair(audiostream, audioentity));
+static std::string toUpper(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return value;
 }
 
-#define MODELUNDEFINED eModelID(-1)
+static std::string relativePath(const fs::path& path) {
+    std::error_code ec;
+    const auto relative = fs::relative(path, gameRoot, ec);
+    return ec ? path.string() : relative.string();
+}
+
+static void updateAudioState(irrklang::ISound* sound, CPhysical* entity) {
+    if (!sound) return;
+
+    // Set the position once when the event occurs. Keeping a raw CPhysical*
+    // until playback completes is unsafe because the game can destroy the entity.
+    if (entity) {
+        const auto& position = entity->GetPosition();
+        sound->setPosition(irrklang::vec3df(position.x, position.y, position.z));
+    }
+
+    float volume = AEAudioHardware.m_fEffectMasterScalingFactor;
+    if (cameraPosition) {
+        const auto& position = sound->getPosition();
+        const float distance = CVector(
+            cameraPosition->x - position.X,
+            cameraPosition->y - position.Y,
+            cameraPosition->z - position.Z
+        ).Magnitude();
+        const float clampedDistance = std::clamp(distance, 0.0f, kMaxDistance);
+        const float distanceFactor = std::pow((kMaxDistance - clampedDistance) / kMaxDistance, 6.0f);
+        volume *= distanceFactor;
+    }
+
+    sound->setVolume(std::clamp(volume, 0.0f, 1.0f));
+    sound->setPlaybackSpeed(CTimer::GetIsSlowMotionActive() ? 0.5f : 1.0f);
+}
+
+static bool playAudio(const fs::path& audioPath, CPhysical* entity) {
+    if (!audioEngine || audioPath.empty()) return false;
+
+    // startPaused=true forces irrKlang to return a tracked interface. We own
+    // that reference and release it when playback finishes or during shutdown.
+    auto* sound = audioEngine->play3D(
+        audioPath.string().c_str(), irrklang::vec3df(0.0f, 0.0f, 0.0f), false, true
+    );
+    if (!sound) return false;
+
+    sound->setMinDistance(kMaxDistance);
+    updateAudioState(sound, entity);
+
+    try {
+        playingSounds.push_back({ sound });
+    }
+    catch (...) {
+        sound->stop();
+        sound->drop();
+        return false;
+    }
+
+    sound->setIsPaused(false);
+    return true;
+}
 
 class AudioStream {
 public:
-	AudioStream() {}
-	fs::path audiosfolder;
-	AudioStream(fs::path weaponfolder) {
-		audiosfolder = weaponfolder;
-	}
-	auto audioPath(string *filename, fs::path *filepath) {
-		auto filelocation = audiosfolder / fs::path(*filename).replace_extension(".wav");
-		if (fs::exists(filelocation)) *filepath = filelocation;
-	}
-	auto audioPlay(string *filename, CPhysical *audioentity) {
-		auto filepath = fs::path();
-		audioPath(filename, &filepath);
+    AudioStream() = default;
+    explicit AudioStream(const fs::path& weaponFolder) : audioFolder(weaponFolder) {}
 
-		if (
-				fs::exists(filepath)
-			&&	!filepath.empty()
-			) {
-			AudioPlay(&filepath, audioentity);
+    bool play(const std::string& filename, CPhysical* entity) const {
+        const fs::path path = audioFolder / fs::path(filename).replace_extension(".wav");
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec) || ec) return false;
+        // Do not claim the override succeeded merely because the WAV exists.
+        return playAudio(path, entity);
+    }
 
-			return true;
-		}
-
-		return false;
-	}
+private:
+    fs::path audioFolder;
 };
-#define AUDIOPLAY(MODELID, FILESTEM, RETURNVALUE) if (findWeapon(&weaponType, eModelID(MODELID), FILESTEM, entity)) RETURNVALUE;
 
-#define AUDIOSHOOT(MODELID, RETURNVALUE) AUDIOPLAY(MODELID, "shoot", RETURNVALUE)
-#define AUDIORELOAD(MODELID, RETURNVALUE) AUDIOPLAY(MODELID, "reload", RETURNVALUE)
-#define AUDIOHIT(MODELID, RETURNVALUE) AUDIOPLAY(MODELID, "hit", RETURNVALUE)
-#define AUDIOSWING(MODELID, RETURNVALUE) AUDIOPLAY(MODELID, "swing", RETURNVALUE)
+static std::map<std::pair<eWeaponType, eModelID>, AudioStream> registeredWeapons;
 
-#define AUDIOCALL(AUDIOMACRO, RETURNVALUE) if (entity->m_nType == eEntityType::ENTITY_TYPE_PED) { AUDIOMACRO(MODELUNDEFINED, RETURNVALUE) } AUDIOMACRO(entity->m_nModelIndex, RETURNVALUE)
-
-auto initializationstatus = int(-2);
-
-auto logfile = fstream();
-#define LOGLINE logfile << "\t" << 
-#define LOGSEPARATOR << " : " <<
-#define LOGNEWLINE << '\n'
-
-auto nameType(string *weaponname, eWeaponType *weapontype) {
-	char weaponchar[255]; sprintf(weaponchar, "%s", caseUpper(*weaponname).c_str());
-	*weapontype = CWeaponInfo::FindWeaponType(weaponchar);
-
-	if (*weapontype > eWeaponType::WEAPON_UNARMED) return true;
-
-	return false;
+static bool getWeaponType(const std::string& weaponName, eWeaponType& weaponType) {
+    const auto normalized = toUpper(weaponName);
+    std::vector<char> buffer(normalized.begin(), normalized.end());
+    buffer.push_back('\0');
+    weaponType = CWeaponInfo::FindWeaponType(buffer.data());
+    return weaponType > eWeaponType::WEAPON_UNARMED;
 }
 
-auto registeredweapons = map<pair<eWeaponType, eModelID>, AudioStream>();
-auto registerWeapon(fs::path *filepath) {
-	auto modelid = MODELUNDEFINED;
-	auto *weaponname = &string(); *weaponname = filepath->stem().string();
+static void registerWeapon(const fs::path& path) {
+    std::string weaponName = path.stem().string();
+    eModelID modelId = eModelID(kModelUndefined);
 
-	auto fileseparator = weaponname->find_first_of(' ');
-	if (fileseparator != string::npos) {
-		char modelname[255]; sprintf(modelname, "%s", weaponname->substr(fileseparator + 1).c_str());
-		auto modelfound = eModelID();
-		CModelInfo::GetModelInfo(modelname, (int *)&modelfound);
-		if (modelfound > MODELUNDEFINED) modelid = modelfound;
-		*weaponname = weaponname->substr(0, fileseparator);
-	}
+    const auto separator = weaponName.find(' ');
+    if (separator != std::string::npos) {
+        const auto modelName = weaponName.substr(separator + 1);
+        std::vector<char> modelBuffer(modelName.begin(), modelName.end());
+        modelBuffer.push_back('\0');
 
-	auto weapontype = eWeaponType();
-	if (nameType(weaponname, &weapontype)) {
-		registeredweapons[make_pair(weapontype, modelid)] = AudioStream(filepath->parent_path());
+        int modelIndex = kModelUndefined;
+        CModelInfo::GetModelInfo(modelBuffer.data(), &modelIndex);
+        if (modelIndex > kModelUndefined) modelId = eModelID(modelIndex);
+        weaponName.resize(separator);
+    }
 
-		LOGLINE weapontype LOGSEPARATOR modelid LOGSEPARATOR outputPath(filepath).c_str() LOGNEWLINE;
-	}
+    eWeaponType weaponType;
+    if (!getWeaponType(weaponName, weaponType)) return;
+
+    registeredWeapons[std::make_pair(weaponType, modelId)] = AudioStream(path.parent_path());
+    if (logFile.is_open()) {
+        LOG_LINE weaponType LOG_SEPARATOR modelId LOG_SEPARATOR relativePath(path) LOG_NEWLINE;
+    }
 }
 
-auto findWeapon(eWeaponType *weapontype, eModelID modelid, string filename, CPhysical *audioentity) {
-	auto audiofind = registeredweapons.find(make_pair(*weapontype, modelid));
-	if (audiofind != registeredweapons.end()) return audiofind->second.audioPlay(&filename, audioentity);
-	return false;
+static bool findWeapon(eWeaponType weaponType, eModelID modelId,
+                       const std::string& filename, CPhysical* entity) {
+    const auto found = registeredWeapons.find(std::make_pair(weaponType, modelId));
+    return found != registeredWeapons.end() && found->second.play(filename, entity);
 }
 
-typedef void(__thiscall *originalCAEWeaponAudioEntity__WeaponFire)(
-	eWeaponType weaponType, CPhysical *entity, int audioEventId
-	);
-typedef void(__thiscall *originalCAEWeaponAudioEntity__WeaponReload)(
-	eWeaponType weaponType, CPhysical *entity, int audioEventId
-	);
-typedef void(__thiscall *originalCAEPedAudioEntity__HandlePedHit)(
-	int a2, CPhysical *a3, unsigned __int8 a4, float a5, unsigned int a6
-	);
-typedef char(__thiscall *originalCAEPedAudioEntity__HandlePedSwing)(
-	int a2, int a3, int a4
-	);
-
-auto subhookCAEWeaponAudioEntity__WeaponFire = subhook_t();
-auto subhookCAEWeaponAudioEntity__WeaponReload = subhook_t();
-auto subhookCAEPedAudioEntity__HandlePedHit = subhook_t();
-auto subhookCAEPedAudioEntity__HandlePedSwing = subhook_t();
-
-auto __fastcall HookedCAEWeaponAudioEntity__WeaponFire(CAEWeaponAudioEntity *thispointer, void *unusedpointer,
-	eWeaponType weaponType, CPhysical *entity, int audioEventId
-) {
-	if (
-			thispointer
-		&&	entity
-		) {
-		AUDIOCALL(AUDIOSHOOT, return)
-	}
-
-	subhook_remove(subhookCAEWeaponAudioEntity__WeaponFire);
-	thispointer->WeaponFire(weaponType, entity, audioEventId);
-	subhook_install(subhookCAEWeaponAudioEntity__WeaponFire);
+static void releaseHook(subhook_t& hook) {
+    if (!hook) return;
+    subhook_remove(hook);
+    subhook_free(hook);
+    hook = nullptr;
 }
-auto __fastcall HookedCAEWeaponAudioEntity__WeaponReload(CAEWeaponAudioEntity *thispointer, void *unusedpointer,
-	eWeaponType weaponType, CPhysical *entity, int audioEventId
-) {
-	if (
-		thispointer
-		&&	entity
-		) {
-		AUDIOCALL(AUDIORELOAD, return)
-	}
 
-	subhook_remove(subhookCAEWeaponAudioEntity__WeaponReload);
-	thispointer->WeaponReload(weaponType, entity, audioEventId);
-	subhook_install(subhookCAEWeaponAudioEntity__WeaponReload);
+static void releaseHooks() {
+    releaseHook(hookWeaponFire);
+    releaseHook(hookWeaponReload);
+    releaseHook(hookPedHit);
+    releaseHook(hookPedSwing);
 }
-auto __fastcall HookedCAEPedAudioEntity__HandlePedHit(CAEPedAudioEntity *thispointer, void *unusedpointer,
-	int a2, CPhysical *a3, unsigned __int8 a4, float a5, unsigned int a6
-) {
-	if (
-			thispointer
-		&&	a3
-		) {
-		auto entity = a3;
-		auto weaponType = thispointer->m_pPed->m_aWeapons[thispointer->m_pPed->m_nActiveWeaponSlot].m_nType;
-		AUDIOCALL(AUDIOHIT, return)
-	}
 
-	subhook_remove(subhookCAEPedAudioEntity__HandlePedHit);
-	plugin::CallMethod<0x4E1CC0, CAEPedAudioEntity *, int, CPhysical *, unsigned __int8, float, unsigned int>(thispointer, a2, a3, a4, a5, a6);
-	subhook_install(subhookCAEPedAudioEntity__HandlePedHit);
+static void releasePlayingSounds(bool stopSounds) {
+    for (auto& playing : playingSounds) {
+        if (!playing.sound) continue;
+        if (stopSounds) playing.sound->stop();
+        playing.sound->drop();
+        playing.sound = nullptr;
+    }
+    playingSounds.clear();
 }
-auto __fastcall HookedCAEPedAudioEntity__HandlePedSwing(CAEPedAudioEntity *thispointer, void *unusedpointer,
-	int a2, int a3, int a4
-) {
-	if (
-			thispointer
-		//&&	
-		) {
-		auto ped = thispointer->m_pPed;
-		auto entity = (CPhysical *)ped;
-		auto weaponType = (&ped->m_aWeapons[ped->m_nActiveWeaponSlot])->m_nType;
-		AUDIOCALL(AUDIOSWING, return char(-1))
-	}
 
-	subhook_remove(subhookCAEPedAudioEntity__HandlePedSwing);
-	auto returnvalue = plugin::CallMethodAndReturn<char, 0x4E1A40, CAEPedAudioEntity *, int, int, int>(thispointer, a2, a3, a4);
-	subhook_install(subhookCAEPedAudioEntity__HandlePedSwing);
-
-	return returnvalue;
+static void shutdownAudio() {
+    releaseHooks();
+    releasePlayingSounds(true);
+    if (audioEngine) {
+        audioEngine->stopAllSounds();
+        audioEngine->drop();
+        audioEngine = nullptr;
+    }
+    cameraPosition = nullptr;
+    if (logFile.is_open()) logFile.close();
 }
-//<
+
+#define MODEL_UNDEFINED eModelID(kModelUndefined)
+#define AUDIO_PLAY(MODEL_ID, FILE_STEM, RETURN_VALUE) \
+    if (findWeapon(weaponType, eModelID(MODEL_ID), FILE_STEM, entity)) RETURN_VALUE;
+#define AUDIO_SHOOT(MODEL_ID, RETURN_VALUE) AUDIO_PLAY(MODEL_ID, "shoot", RETURN_VALUE)
+#define AUDIO_RELOAD(MODEL_ID, RETURN_VALUE) AUDIO_PLAY(MODEL_ID, "reload", RETURN_VALUE)
+#define AUDIO_HIT(MODEL_ID, RETURN_VALUE) AUDIO_PLAY(MODEL_ID, "hit", RETURN_VALUE)
+#define AUDIO_SWING(MODEL_ID, RETURN_VALUE) AUDIO_PLAY(MODEL_ID, "swing", RETURN_VALUE)
+#define AUDIO_CALL(AUDIO_MACRO, RETURN_VALUE) \
+    if (entity->m_nType == eEntityType::ENTITY_TYPE_PED) { AUDIO_MACRO(MODEL_UNDEFINED, RETURN_VALUE) } \
+    AUDIO_MACRO(entity->m_nModelIndex, RETURN_VALUE)
+
+static void __fastcall hookedWeaponFire(CAEWeaponAudioEntity* self, void*,
+                                        eWeaponType weaponType, CPhysical* entity, int audioEventId) {
+    if (!self) return;
+    if (entity) { AUDIO_CALL(AUDIO_SHOOT, return); }
+
+    subhook_remove(hookWeaponFire);
+    self->WeaponFire(weaponType, entity, audioEventId);
+    subhook_install(hookWeaponFire);
+}
+
+static void __fastcall hookedWeaponReload(CAEWeaponAudioEntity* self, void*,
+                                          eWeaponType weaponType, CPhysical* entity, int audioEventId) {
+    if (!self) return;
+    if (entity) { AUDIO_CALL(AUDIO_RELOAD, return); }
+
+    subhook_remove(hookWeaponReload);
+    self->WeaponReload(weaponType, entity, audioEventId);
+    subhook_install(hookWeaponReload);
+}
+
+static void __fastcall hookedPedHit(CAEPedAudioEntity* self, void*, int a2, CPhysical* entity,
+                                    unsigned __int8 a4, float a5, unsigned int a6) {
+    if (!self) return;
+    if (entity && self->m_pPed) {
+        auto weaponType = self->m_pPed->m_aWeapons[self->m_pPed->m_nActiveWeaponSlot].m_nType;
+        AUDIO_CALL(AUDIO_HIT, return);
+    }
+
+    subhook_remove(hookPedHit);
+    plugin::CallMethod<0x4E1CC0, CAEPedAudioEntity*, int, CPhysical*, unsigned __int8, float, unsigned int>(
+        self, a2, entity, a4, a5, a6
+    );
+    subhook_install(hookPedHit);
+}
+
+static char __fastcall hookedPedSwing(CAEPedAudioEntity* self, void*, int a2, int a3, int a4) {
+    if (!self) return 0;
+    auto* ped = self->m_pPed;
+    if (ped) {
+        auto* entity = static_cast<CPhysical*>(ped);
+        auto weaponType = ped->m_aWeapons[ped->m_nActiveWeaponSlot].m_nType;
+        AUDIO_CALL(AUDIO_SWING, return char(-1));
+    }
+
+    subhook_remove(hookPedSwing);
+    const auto returnValue = plugin::CallMethodAndReturn<char, 0x4E1A40, CAEPedAudioEntity*, int, int, int>(
+        self, a2, a3, a4
+    );
+    subhook_install(hookPedSwing);
+    return returnValue;
+}
+
+static bool installHooks() {
+    hookWeaponFire = subhook_new(reinterpret_cast<void*>(0x504F80),
+                                 reinterpret_cast<void*>(hookedWeaponFire), subhook_flags_t(0));
+    hookWeaponReload = subhook_new(reinterpret_cast<void*>(0x503690),
+                                   reinterpret_cast<void*>(hookedWeaponReload), subhook_flags_t(0));
+    hookPedHit = subhook_new(reinterpret_cast<void*>(0x4E1CC0),
+                              reinterpret_cast<void*>(hookedPedHit), subhook_flags_t(0));
+    hookPedSwing = subhook_new(reinterpret_cast<void*>(0x4E1A40),
+                                reinterpret_cast<void*>(hookedPedSwing), subhook_flags_t(0));
+
+    if (!hookWeaponFire || !hookWeaponReload || !hookPedHit || !hookPedSwing) {
+        releaseHooks();
+        return false;
+    }
+
+    if (subhook_install(hookWeaponFire) != 0 ||
+        subhook_install(hookWeaponReload) != 0 ||
+        subhook_install(hookPedHit) != 0 ||
+        subhook_install(hookPedSwing) != 0) {
+        releaseHooks();
+        return false;
+    }
+    return true;
+}
 
 class EarShot {
 public:
     EarShot() {
-        // Initialise your plugin here
-        
-//>
-		if (fs::exists(folderdata)) foldermod = folderdata;
-		else fs::create_directories(foldermod);
+        std::error_code ec;
+        if (fs::is_directory(dataFolder, ec) && !ec) {
+            modFolder = dataFolder;
+        } else {
+            ec.clear();
+            fs::create_directories(modFolder, ec);
+            if (ec) {
+                showMessage("Could not create EarShot folder: " + ec.message());
+                initializationStatus = -1;
+                return;
+            }
+        }
 
-		logfile.open(foldermod / fs::path(modname).replace_extension(".log"), fstream::out);
+        logFile.open(modFolder / (kModName + ".log"), std::ios::out | std::ios::trunc);
+        if (!logFile.is_open()) {
+            showMessage("Could not open EarShot log file.");
+        }
 
-		Events::initRwEvent += [] {
-			audioengine = irrklang::createIrrKlangDevice();
+        Events::initRwEvent += [] {
+            if (audioEngine) return;
+            audioEngine = irrklang::createIrrKlangDevice();
+            if (audioEngine) audioEngine->setRolloffFactor(0.0f);
+        };
 
-			audioengine->setRolloffFactor(0.0f);
-		};
+        Events::shutdownRwEvent += [] {
+            shutdownAudio();
+            initializationStatus = -1;
+        };
 
-		Events::processScriptsEvent += [] {
-			if (initializationstatus != -2) return;
+        Events::processScriptsEvent += [] {
+            if (initializationStatus != -2) return;
+            initializationStatus = 0;
 
-			initializationstatus = 0;
+            Events::gameProcessEvent += [] {
+                if (initializationStatus == 0) {
+                    if (!audioEngine) {
+                        showMessage("Could not start up irrKlang audio engine.");
+                        initializationStatus = -1;
+                        return;
+                    }
 
-			Events::gameProcessEvent += [] {
-				if (initializationstatus == 0) {
-					if (!audioengine) {
-						modMessage("Could not start up irrKlang audio engine.");
-						initializationstatus = -1;
-					}
-				}
+                    if (logFile.is_open()) logFile << "File(s) (Overwritten by Mod Loader):" LOG_NEWLINE;
+                    std::error_code scanError;
+                    for (fs::recursive_directory_iterator it(
+                             modFolder, fs::directory_options::skip_permission_denied, scanError), end;
+                         !scanError && it != end; it.increment(scanError)) {
+                        std::error_code fileError;
+                        if (!it->is_regular_file(fileError) || fileError) continue;
+                        if (toLower(it->path().extension().string()) == kModExtension) {
+                            registerWeapon(it->path());
+                        }
+                    }
+                    if (scanError && logFile.is_open()) {
+                        logFile << "Directory scan stopped: " << scanError.message() << LOG_NEWLINE;
+                    }
 
-				if (initializationstatus != -1) {
-					if (initializationstatus == 0) {
-						logfile << "File(s) (Overwritten by Mod Loader):" LOGNEWLINE;
-						for (auto directoryentry : fs::recursive_directory_iterator(foldermod)) {
-							auto entrypath = directoryentry.path();
-							if (!fs::is_directory(entrypath)) {
-								auto fileextension = caseLower(entrypath.extension().string());
-								if (fileextension == modextension) registerWeapon(&entrypath);
-							}
-						}
+                    auto module = GetModuleHandleA("AutoID3000ML.dll");
+                    if (module) {
+                        auto getFiles = GetProcAddress(module, "getFiles");
+                        if (getFiles) {
+                            using AutoIdFiles = const char**(__cdecl*)(const char*, int*);
+                            auto getModLoaderFiles = reinterpret_cast<AutoIdFiles>(getFiles);
+                            int fileCount = 0;
+                            const char** files = getModLoaderFiles(kModExtension.c_str(), &fileCount);
+                            // The original API integration reserves the final entry; keep
+                            // its established convention but guard invalid/empty results.
+                            if (fileCount > 0) --fileCount;
+                            if (files && fileCount > 0) {
+                                if (logFile.is_open()) logFile << "File(s) (Mod Loader):" LOG_NEWLINE;
+                                for (int index = 0; index < fileCount; ++index) {
+                                    if (files[index]) registerWeapon(gameRoot / fs::path(files[index]));
+                                }
+                            }
+                        }
+                    } else if (logFile.is_open()) {
+                        logFile << "Mod Loader support requires AutoID3000." << LOG_NEWLINE;
+                    }
 
-						logfile LOGNEWLINE;
-						auto autoid3000mlmodule = GetModuleHandle("AutoID3000ML.dll");
-						if (autoid3000mlmodule) {
-							auto getfiles = GetProcAddress(autoid3000mlmodule, "getFiles");
-							if (getfiles) {
-								logfile << "File(s) (Mod Loader):" LOGNEWLINE;
-								typedef const char **(_cdecl *autoid3000mlfiles)(const char *, int *);
-								auto AutoID3000MLFiles = (autoid3000mlfiles)getfiles;
+                    if (registeredWeapons.empty()) {
+                        if (logFile.is_open()) logFile << "No audio files found. Stopping work for this session." LOG_NEWLINE;
+                        shutdownAudio();
+                        initializationStatus = -1;
+                        return;
+                    }
+                    if (logFile.is_open()) logFile << "Total: " << registeredWeapons.size() << LOG_NEWLINE;
 
-								auto mlamount = int(); auto mlfiles = AutoID3000MLFiles(modextension.c_str(), &mlamount); --mlamount;
-								for (auto mlindex = int(0); mlindex < mlamount; ++mlindex) registerWeapon(&(folderroot / fs::path(mlfiles[mlindex])));
-							}
-						}
-						else logfile << "Mod Loader support requires AutoID3000.";
+                    if (!installHooks()) {
+                        if (logFile.is_open()) logFile << "Failed to install one or more hooks." LOG_NEWLINE;
+                        showMessage("EarShot could not install its game hooks. Check the log file.");
+                        shutdownAudio();
+                        initializationStatus = -1;
+                        return;
+                    }
 
-						auto registeredtotal = registeredweapons.size();
+                    Events::onPauseAllSounds += [] {
+                        if (audioEngine) audioEngine->setAllSoundsPaused(true);
+                    };
+                    Events::onResumeAllSounds += [] {
+                        if (audioEngine && !FrontEndMenuManager.m_bMenuActive) audioEngine->setAllSoundsPaused(false);
+                    };
+                    Events::gameProcessEvent += [] {
+                        if (audioEngine) audioEngine->setAllSoundsPaused(FrontEndMenuManager.m_bMenuActive);
+                    };
+                    if (logFile.is_open()) logFile.close();
+                    initializationStatus = 1;
+                }
 
-						if (registeredtotal == 0) {
-							initializationstatus = -1;
-							logfile LOGNEWLINE << "No file(s) found. Stopping work for this session." LOGNEWLINE;
-							logfile.close();
-							return;
-						}
+                if (initializationStatus != 1 || !audioEngine) return;
 
-						logfile LOGNEWLINE << "Total: " << registeredtotal;
+                cameraPosition = &TheCamera.GetPosition();
+                const auto forward = TheCamera.m_matrix
+                    ? TheCamera.GetForward() : CVector(0.0f, 1.0f, 0.0f);
+                const auto up = TheCamera.m_matrix
+                    ? TheCamera.GetUp() : CVector(0.0f, 0.0f, 1.0f);
+                audioEngine->setListenerPosition(
+                    irrklang::vec3df(cameraPosition->x, cameraPosition->y, cameraPosition->z),
+                    irrklang::vec3df(forward.x, forward.y, forward.z),
+                    irrklang::vec3df(0.0f, 0.0f, 0.0f),
+                    irrklang::vec3df(up.x, up.y, up.z)
+                );
 
-						subhookCAEWeaponAudioEntity__WeaponFire = subhook_new((void *)(originalCAEWeaponAudioEntity__WeaponFire)0x504F80, HookedCAEWeaponAudioEntity__WeaponFire, subhook_flags_t(0)); //CAEWeaponAudioEntity::WeaponFire
-						subhookCAEWeaponAudioEntity__WeaponReload = subhook_new((void *)(originalCAEWeaponAudioEntity__WeaponReload)0x503690, HookedCAEWeaponAudioEntity__WeaponReload, subhook_flags_t(0)); //CAEWeaponAudioEntity::WeaponReload
-						subhookCAEPedAudioEntity__HandlePedHit = subhook_new((void *)(originalCAEPedAudioEntity__HandlePedHit)0x4E1CC0, HookedCAEPedAudioEntity__HandlePedHit, subhook_flags_t(0)); //CAEPedAudioEntity::HandlePedHit
-						subhookCAEPedAudioEntity__HandlePedSwing = subhook_new((void *)(originalCAEPedAudioEntity__HandlePedSwing)0x4E1A40, HookedCAEPedAudioEntity__HandlePedSwing, subhook_flags_t(0)); //CAEPedAudioEntity::HandlePedSwing
-						
-						subhook_install(subhookCAEWeaponAudioEntity__WeaponFire);
-						subhook_install(subhookCAEWeaponAudioEntity__WeaponReload);
-						subhook_install(subhookCAEPedAudioEntity__HandlePedHit);
-						subhook_install(subhookCAEPedAudioEntity__HandlePedSwing);
-
-						Events::onPauseAllSounds += [] { audioengine->setAllSoundsPaused(); };
-						Events::onResumeAllSounds += [] { if (FrontEndMenuManager.m_bMenuActive) return; audioengine->setAllSoundsPaused(false); };
-						Events::gameProcessEvent += [] { audioengine->setAllSoundsPaused(FrontEndMenuManager.m_bMenuActive); };
-
-						logfile.close();
-					}
-
-					cameraposition = &TheCamera.GetPosition();
-
-					audioengine->setListenerPosition(
-							irrklang::vec3df(cameraposition->x, cameraposition->y, cameraposition->z)
-						,	irrklang::vec3df(0.0f, 0.0f, 0.0f)
-						,	irrklang::vec3df(0.0f, 0.0f, 0.0f)
-						,	irrklang::vec3df(0.0f, 0.0f, 1.0f)
-					);
-
-					audiosplaying.erase(remove_if(audiosplaying.begin(), audiosplaying.end(), [](pair<irrklang::ISound *, CPhysical *> audioplaying) {
-						auto audiostream = audioplaying.first;
-						auto audioentity = audioplaying.second;
-						if (audiostream->isFinished()) {
-
-							return true;
-						}
-
-						audioState(audiostream, audioentity);
-
-						return false;
-					}), audiosplaying.end());
-				}
-
-				if (initializationstatus == 0) initializationstatus = 1;
-			};
-		};
-//<
+                auto it = playingSounds.begin();
+                while (it != playingSounds.end()) {
+                    auto* sound = it->sound;
+                    if (!sound || sound->isFinished()) {
+                        if (sound) sound->drop();
+                        it = playingSounds.erase(it);
+                    } else {
+                        updateAudioState(sound, nullptr);
+                        ++it;
+                    }
+                }
+            };
+        };
     }
-//>
-//<
 } earShot;
 
-//>
-//<
+} // namespace
