@@ -47,11 +47,13 @@ jobs:
         working-directory: ${{ steps.locate.outputs.dir }}
         run: ./core_test
 
-  # Builds the GTA San Andreas ASI (Win32, Release) with MSBuild.
+  # Builds the GTA San Andreas ASI (Win32, Release).
+  # Plugin-SDK (master, v.1005+) is generated and built with its own premake script,
+  # the same way its own CI does. The runner must have Visual Studio 2026 for "vs2026".
   build:
     name: Build EarShot.asi (GTA SA, Win32)
     needs: core-tests
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     env:
       PLUGIN_SDK_DIR: ${{ github.workspace }}\plugin-sdk
     steps:
@@ -70,43 +72,49 @@ jobs:
         shell: pwsh
         run: git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git plugin-sdk
 
-      - name: Verify Plugin-SDK library exists
+      - uses: microsoft/setup-msbuild@v3
+
+      - name: Generate and build Plugin-SDK (San Andreas, Release)
         shell: pwsh
         run: |
-          $lib = Join-Path $env:PLUGIN_SDK_DIR 'output\lib\plugin.lib'
-          if (Test-Path $lib) {
-            Write-Host "Found $lib"
-            exit 0
-          }
-          Write-Host "Expected $lib, not found. Plugin-SDK top level and all .lib files:"
-          Get-ChildItem $env:PLUGIN_SDK_DIR -Force | Select-Object -ExpandProperty Name
-          Get-ChildItem $env:PLUGIN_SDK_DIR -Recurse -Filter *.lib -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.FullName.Substring($env:PLUGIN_SDK_DIR.Length) }
-          Write-Error "plugin.lib is not at output\lib. See the list above and adjust the workflow or the project's PLUGIN_SDK_DIR."
-          exit 1
+          Push-Location $env:PLUGIN_SDK_DIR
+          & "$env:PLUGIN_SDK_DIR\tools\premake\premake5.exe" vs2026 --file="$env:PLUGIN_SDK_DIR\tools\premake\premake5.lua"
+          if ($LASTEXITCODE -ne 0) { throw "premake failed" }
+          # Same target as the SDK's own "Plugin GTA SA" workflow. Release produces Plugin.lib.
+          msbuild plugin.slnx /property:Configuration=Release "/property:Platform=Mixed Platforms" /target:plugin_sa /m /verbosity:minimal
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "Plugin-SDK build failed" }
 
-      - uses: microsoft/setup-msbuild@v2
+          $lib = Join-Path $env:PLUGIN_SDK_DIR 'output\lib\Plugin.lib'
+          if (-not (Test-Path $lib)) {
+            Get-ChildItem (Join-Path $env:PLUGIN_SDK_DIR 'output') -Recurse -Filter *.lib -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+            throw "Expected $lib after the SDK build."
+          }
+          Write-Host "Built $lib"
 
       - name: Choose platform toolset
         id: toolset
         shell: pwsh
         run: |
-          # The project uses v141_xp (Windows XP compatible). Hosted images do not always
-          # ship that toolset, so fall back to v142 and say so in the log.
+          # The project uses v141_xp. If the runner does not have it, use the newest
+          # installed v1xx toolset instead and warn: that build will not run on Windows XP.
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $found = $false
-          if (Test-Path $vswhere) {
-            $path = & $vswhere -latest -products * `
-              -requires Microsoft.VisualStudio.Component.VC.v141.x86.x64 Microsoft.VisualStudio.Component.WinXP `
-              -property installationPath
-            $found = [bool]$path
-          }
-          if ($found) {
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $toolsets = Get-ChildItem (Join-Path $vsPath 'MSBuild\Microsoft\VC\v*\Platforms\Win32\PlatformToolsets') -Directory -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+          $toolsets | ForEach-Object { "Available toolset: $_" } | Write-Host
+
+          if ($toolsets -contains 'v141_xp') {
             "override=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Host "Using the project toolset (v141_xp)."
+            Write-Host 'Using the project toolset v141_xp.'
           } else {
-            "override=/p:PlatformToolset=v142 /p:WindowsTargetPlatformVersion=10.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Warning "v141_xp is not installed on this runner. Building with v142: the output will not run on Windows XP."
+            $newest = $toolsets | Where-Object { $_ -match '^v1\d\d$' } |
+              Sort-Object { [int]($_.Substring(1)) } | Select-Object -Last 1
+            if (-not $newest) { throw 'No v1xx platform toolset found on this runner.' }
+            "override=/p:PlatformToolset=$newest /p:WindowsTargetPlatformVersion=10.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Warning "v141_xp is not installed. Building with $newest; the output will not run on Windows XP."
           }
 
       - name: Build GTASA Release
@@ -120,7 +128,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Collect output
-        id: collect
         shell: pwsh
         run: |
           $dist = 'dist'
