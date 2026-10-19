@@ -9,7 +9,6 @@ Re-EarShot — это переработанная версия оригинал
 - Проведён рефакторинг и оптимизация кода.
 - Исправлены утечки памяти и улучшено управление ресурсами.
 - Улучшена инициализация игровых событий.
-- Поддерживается замена звуков оружия с помощью WAV-файлов.
 
 ## Установка
 1. Скачайте `EarShot.asi` со страницы [Releases](../../releases)и поместите `EarShot.asi` в корневую папку GTA San Andreas, рядом с `gta_sa.exe`.
@@ -81,7 +80,6 @@ The project focuses on improving the original code, fixing bugs, improving memor
 - Refactored and optimized the code.
 - Fixed memory leaks and improved resource management.
 - Improved game event initialization.
-- Supports replacing weapon sounds using WAV files.
 
 ## Installation
 
