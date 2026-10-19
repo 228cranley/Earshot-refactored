@@ -11,156 +11,76 @@ permissions:
   contents: read
 
 jobs:
-  # Platform-independent tests of EarShotCore.h, with AddressSanitizer,
-  # UndefinedBehaviourSanitizer and LeakSanitizer enabled.
   core-tests:
-    name: Core unit tests (Linux, sanitizers)
+    name: Core tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Locate core tests
-        id: locate
-        shell: bash
-        run: |
-          file=$(find . -name core_test.cpp -path '*EarShot/EarShot/tests/*' -not -path './.git/*' | head -n 1)
-          if [ -z "$file" ]; then
-            echo "::error::tests/core_test.cpp was not found in the repository."
-            echo "Expected SOURCE/repo/EarShot/EarShot/tests/core_test.cpp relative to the repository root."
-            echo "Repository tree (first 200 entries):"
-            find . -not -path './.git*' | sort | head -n 200
-            exit 1
-          fi
-          echo "dir=$(dirname "$file")" >> "$GITHUB_OUTPUT"
-          echo "Found tests in $(dirname "$file")"
-
       - name: Build tests
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -g \
-            -fsanitize=address,undefined -fno-sanitize-recover=all \
-            core_test.cpp -o core_test
-
+        working-directory: SOURCE/repo/EarShot/EarShot/tests
+        run: g++ -std=c++17 -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=all core_test.cpp -o core_test
       - name: Run tests
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.dir }}
+        working-directory: SOURCE/repo/EarShot/EarShot/tests
         run: ./core_test
 
-  # Builds the GTA San Andreas ASI (Win32, Release).
-  # Plugin-SDK (master, v.1005+) is generated and built with its own premake script,
-  # the same way its own CI does. The runner must have Visual Studio 2026 for "vs2026".
   build:
-    name: Build EarShot.asi (GTA SA, Win32)
+    name: Build EarShot.asi (GTA SA Win32)
     needs: core-tests
-    runs-on: windows-2025-vs2026
-    env:
-      PLUGIN_SDK_DIR: ${{ github.workspace }}\plugin-sdk
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check project files
-        shell: pwsh
-        run: |
-          if (-not (Test-Path 'SOURCE\repo\EarShot\EarShot.sln')) {
-            Write-Error 'SOURCE\repo\EarShot\EarShot.sln not found. The repository root must contain the SOURCE folder.'
-            Get-ChildItem -Recurse -Depth 3 | Select-Object -ExpandProperty FullName
-            exit 1
-          }
+      - uses: microsoft/setup-msbuild@v2
 
       - name: Fetch Plugin-SDK
         shell: pwsh
-        run: git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git plugin-sdk
+        run: |
+          git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git SOURCE/repo/EarShot/plugin-sdk
+          git -C SOURCE/repo/EarShot/plugin-sdk rev-parse HEAD
 
-      - uses: microsoft/setup-msbuild@v3
+      - name: Generate Plugin-SDK solution
+        shell: pwsh
+        working-directory: SOURCE/repo/EarShot/plugin-sdk
+        env:
+          PLUGIN_SDK_DIR: ${{ github.workspace }}\SOURCE\repo\EarShot\plugin-sdk
+        run: |
+          & .\tools\premake\premake5.exe vs2022 --file=.\tools\premake\premake5.lua
+          if ($LASTEXITCODE -ne 0) { throw 'Premake failed to generate Plugin-SDK solution.' }
 
-      - name: Generate and build Plugin-SDK (San Andreas, Release)
+      - name: Build Plugin-SDK for GTA San Andreas
+        shell: pwsh
+        working-directory: SOURCE/repo/EarShot/plugin-sdk
+        env:
+          PLUGIN_SDK_DIR: ${{ github.workspace }}\SOURCE\repo\EarShot\plugin-sdk
+        run: |
+          msbuild .\plugin.sln /m /nologo /verbosity:minimal /property:Configuration=Release '/property:Platform=Mixed Platforms' /target:Plugin_SA /property:PlatformToolset=v143 /property:WindowsTargetPlatformVersion=10.0
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin-SDK build failed.' }
+          if (-not (Test-Path '.\output\lib\Plugin.lib')) { throw 'Plugin.lib was not created.' }
+
+      - name: Build EarShot Release
         shell: pwsh
         run: |
-          Push-Location $env:PLUGIN_SDK_DIR
-          & "$env:PLUGIN_SDK_DIR\tools\premake\premake5.exe" vs2026 --file="$env:PLUGIN_SDK_DIR\tools\premake\premake5.lua"
-          if ($LASTEXITCODE -ne 0) { throw "premake failed" }
-          # Same target as the SDK's own "Plugin GTA SA" workflow. Release produces Plugin.lib.
-          msbuild plugin.slnx /property:Configuration=Release "/property:Platform=Mixed Platforms" /target:plugin_sa /m /verbosity:minimal
-          $built = $LASTEXITCODE
-          Pop-Location
-          if ($built -ne 0) { throw "Plugin-SDK build failed" }
+          msbuild 'SOURCE\repo\EarShot\EarShot.sln' /m /nologo /verbosity:minimal '/property:Configuration=GTASA Release' '/property:Platform=x86' /property:PlatformToolset=v143 /property:WindowsTargetPlatformVersion=10.0
+          if ($LASTEXITCODE -ne 0) { throw 'EarShot build failed.' }
+          if (-not (Test-Path 'SOURCE\release\EarShot\EarShot.asi')) { throw 'EarShot.asi was not created.' }
 
-          $lib = Join-Path $env:PLUGIN_SDK_DIR 'output\lib\Plugin.lib'
-          if (-not (Test-Path $lib)) {
-            Get-ChildItem (Join-Path $env:PLUGIN_SDK_DIR 'output') -Recurse -Filter *.lib -ErrorAction SilentlyContinue |
-              ForEach-Object { $_.FullName }
-            throw "Expected $lib after the SDK build."
-          }
-          Write-Host "Built $lib"
-
-      - name: Choose platform toolset
-        id: toolset
+      - name: Prepare release artifact
         shell: pwsh
         run: |
-          # The project uses v141_xp. If the runner does not have it, use the newest
-          # installed v1xx toolset instead and warn: that build will not run on Windows XP.
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
-          if (-not $vsPath) { throw 'vswhere found no Visual Studio installation.' }
-
-          # Layout: <VS>\MSBuild\Microsoft\VC\vNNN\Platforms\Win32\PlatformToolsets\<toolset>
-          $toolsets = Get-ChildItem (Join-Path $vsPath 'MSBuild\Microsoft\VC') -Directory -Filter 'v*' |
-            ForEach-Object { Join-Path $_.FullName 'Platforms\Win32\PlatformToolsets' } |
-            Where-Object { Test-Path $_ } |
-            ForEach-Object { Get-ChildItem $_ -Directory } |
-            Select-Object -ExpandProperty Name | Sort-Object -Unique
-          $toolsets | ForEach-Object { "Available toolset: $_" } | Write-Host
-
-          if ($toolsets -contains 'v141_xp') {
-            "override=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Host 'Using the project toolset v141_xp.'
-          } else {
-            $newest = $toolsets | Where-Object { $_ -match '^v1\d\d$' } |
-              Sort-Object { [int]($_.Substring(1)) } | Select-Object -Last 1
-            if (-not $newest) { throw 'No v1xx platform toolset found on this runner.' }
-            "override=/p:PlatformToolset=$newest /p:WindowsTargetPlatformVersion=10.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Warning "v141_xp is not installed. Building with $newest; the output will not run on Windows XP."
-          }
-
-      - name: Build GTASA Release
-        shell: pwsh
-        run: |
-          $extra = @()
-          if ('${{ steps.toolset.outputs.override }}') {
-            $extra = '${{ steps.toolset.outputs.override }}'.Split(' ')
-          }
-          # The solution uses the x86 platform name; its project maps it to the Win32 project configuration.
-          msbuild "SOURCE\repo\EarShot\EarShot.sln" "/p:Configuration=GTASA Release" "/p:Platform=x86" /m /nologo /v:minimal @extra
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Collect output
-        shell: pwsh
-        run: |
-          $dist = 'dist'
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          $asi = Get-ChildItem 'SOURCE\release\EarShot' -Filter 'EarShot.asi' -ErrorAction Stop
-          Copy-Item $asi.FullName $dist
-
-          # EarShot needs irrKlang.dll at runtime. It is not stored in this repository
-          # because it is distributed by its author. Put it at this path to include it.
-          $dll = 'SOURCE\repo\EarShot\EarShot\include\irrKlang-1.6.0\bin\win32-visualStudio\irrKlang.dll'
-          if (Test-Path $dll) {
-            Copy-Item $dll $dist
-          } else {
-            Write-Warning 'irrKlang.dll was not found. Copy it next to EarShot.asi in the game folder before running.'
-          }
-          Get-ChildItem $dist | Format-Table Name, Length
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item 'SOURCE\release\EarShot\EarShot.asi' dist\EarShot.asi
+          Copy-Item README.md dist\README.md
+          Copy-Item LICENSE dist\LICENSE
+          Get-ChildItem dist | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
-          name: EarShot-GTASA
+          name: EarShot-GTASA-Win32
           path: dist/*
           if-no-files-found: error
 
-  # Publishes the build as a GitHub Release when a version tag (v1.2.3) is pushed.
   release:
-    name: Publish release
+    name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
@@ -169,15 +89,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: EarShot-GTASA
+          name: EarShot-GTASA-Win32
           path: dist
-
-      - name: Create release
+      - name: Package release
+        run: cd dist && zip -r "../EarShot-${GITHUB_REF_NAME}-GTASA-Win32.zip" .
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd dist
-          zip -r "../EarShot-${GITHUB_REF_NAME}-GTASA.zip" .
-          cd ..
-          gh release create "$GITHUB_REF_NAME" "EarShot-${GITHUB_REF_NAME}-GTASA.zip" \
-            --title "EarShot ${GITHUB_REF_NAME}" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" "EarShot-${GITHUB_REF_NAME}-GTASA-Win32.zip" --title "EarShot ${GITHUB_REF_NAME}" --generate-notes
