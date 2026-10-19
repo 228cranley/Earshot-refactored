@@ -1,0 +1,63 @@
+name: Build EarShot (GTA San Andreas)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout EarShot
+        uses: actions/checkout@v6
+
+      - name: Install MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Checkout Plugin-SDK
+        uses: actions/checkout@v6
+        with:
+          repository: DK22Pac/plugin-sdk
+          ref: master
+          path: external/plugin-sdk
+          submodules: recursive
+
+      - name: Generate Plugin-SDK Visual Studio projects
+        shell: cmd
+        working-directory: external/plugin-sdk
+        run: |
+          set "PLUGIN_SDK_DIR=%GITHUB_WORKSPACE%\external\plugin-sdk"
+          call "tools\generate\Visual Studio.bat"
+
+      - name: Build Plugin-SDK for GTA San Andreas
+        shell: cmd
+        working-directory: external/plugin-sdk
+        run: |
+          set "PLUGIN_SDK_DIR=%GITHUB_WORKSPACE%\external\plugin-sdk"
+          msbuild plugin.slnx /property:Configuration=Release /property:Platform="Mixed Platforms" /target:plugin_sa /m /verbosity:minimal
+
+      - name: Build EarShot
+        shell: cmd
+        run: |
+          set "PLUGIN_SDK_DIR=%GITHUB_WORKSPACE%\external\plugin-sdk"
+          msbuild "SOURCE\repo\EarShot\EarShot.sln" /property:Configuration="GTASA Release" /property:Platform=x86 /property:PLUGIN_SDK_DIR="%PLUGIN_SDK_DIR%" /m /verbosity:minimal
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $output = "SOURCE/release/EarShot/EarShot.asi"
+          if (!(Test-Path $output)) {
+            Write-Error "Build did not produce $output"
+          }
+
+      - name: Upload EarShot.asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: EarShot-GTASA
+          path: SOURCE/release/EarShot/EarShot.asi
+          if-no-files-found: error
+          retention-days: 14
