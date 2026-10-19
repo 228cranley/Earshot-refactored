@@ -130,7 +130,8 @@ jobs:
           if ('${{ steps.toolset.outputs.override }}') {
             $extra = '${{ steps.toolset.outputs.override }}'.Split(' ')
           }
-          msbuild "SOURCE\repo\EarShot\EarShot.sln" "/p:Configuration=GTASA Release" "/p:Platform=Win32" /m /nologo /v:minimal @extra
+          # The solution uses the x86 platform name; its project maps it to the Win32 project configuration.
+          msbuild "SOURCE\repo\EarShot\EarShot.sln" "/p:Configuration=GTASA Release" "/p:Platform=x86" /m /nologo /v:minimal @extra
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Collect output
