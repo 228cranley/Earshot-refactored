@@ -1,35 +1,86 @@
-# EarShot source audit and refactor notes
+# Аудит EarShot и список изменений
 
-This audit is based on the source archive supplied for the original `HzanRsxa2959/Earshot` repository. It does not claim that the resulting binary has been tested inside GTA SA or multiplayer clients.
+Строки в колонке «Где» относятся к исходному `EarShot.cpp` (оригинальный архив).
 
-## Findings fixed
+## Утечки памяти и ресурсов
 
-1. **Tracked irrKlang sounds were never released.** `play3D(..., startPaused=true, ...)` returns a tracked `ISound` interface whose reference must be dropped when the caller is done with it. The old code removed finished sounds from the vector without calling `drop()`. The refactor now drops the reference on completion, on vector-allocation failure, and on shutdown.
-2. **The audio engine had no teardown path.** Added cleanup at `Events::shutdownRwEvent`: remove/free hooks, stop and release tracked sounds, stop and drop the engine, clear the camera pointer, and close the log if open.
-3. **A temporary string was used through a pointer.** The old registration code took the address of `string()` and then kept using it. It now uses ordinary local `std::string` values and bounded, null-terminated character buffers for SDK APIs.
-4. **A WAV's existence was treated as a successful replacement.** `AudioStream::play` now returns the actual result of `play3D`. If the engine cannot create the sound, the hook lets GTA's original sound path run instead of silently suppressing it.
-5. **Several unchecked null / initialization cases.** The engine is checked before use; audio state tolerates the camera position not yet being available; game hooks avoid dereferencing null audio entities/ped pointers; pause callbacks verify that the engine still exists.
-6. **Game entities could be dereferenced after destruction.** The old playing-sounds list retained raw `CPhysical*` pointers and dereferenced them every frame. The refactored list stores only `ISound*`; the emitter position is captured at the event, so the sound no longer needs a potentially stale game-entity pointer.
-7. **Filesystem and logging operations were fragile.** Directory creation/scanning use `std::error_code` and skip inaccessible entries; regular-file checks avoid throwing from hot paths; path logging no longer erases a fixed number of characters from an arbitrary path.
-8. **Unsafe / brittle string handling.** ASCII case conversion now casts to `unsigned char` for the C character routines, and fixed 255-byte `sprintf` buffers are replaced with sized `std::vector<char>` buffers.
-9. **Hook setup previously ignored failures.** Hook creation and installation results are checked. Partial setup is cleaned up, and the plugin reports the failure rather than proceeding in an unknown state.
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 1 | 93, 366-377 | `play3D()` возвращает `ISound*`, который по документации irrKlang нужно освобождать через `drop()`. Код не вызывал `drop()` ни при завершении звука, ни при удалении из списка. Утечка на каждый выстрел и каждый удар. | `ActiveSounds::Tick` вызывает `drop()` у завершённых звуков, `Clear()` останавливает и освобождает оставшиеся при выгрузке. Тесты проверяют, что каждый дескриптор освобождён ровно один раз. |
+| 2 | 287, 285 | `ISoundEngine` никогда не освобождался. | Освобождается в `Shutdown()` после остановки звуков. |
+| 3 | 340-343 | `subhook_new()` выделяет память на каждый хук, она не освобождалась. | `subhook_free()` при выгрузке, после `subhook_remove()`. Порядок важен: `subhook_free` не снимает патч, без предварительного `remove` игра осталась бы с `jmp` в освобождённый трамплин. |
+| 4 | 93, 117-126 | Звук читался с диска при каждом воспроизведении, а перед этим дважды вызывался `fs::exists`. | Источники загружаются один раз на пару (оружие, файл) и кешируются, включая результат «файла нет». |
 
-## Behavior and compatibility notes
+## Висячие указатели и неопределённое поведение
 
-- The hooks at `0x504F80`, `0x503690`, `0x4E1CC0`, and `0x4E1A40` are GTA San Andreas addresses. The automated build therefore targets **GTASA Release only**. The other legacy configurations in the original Visual Studio project are not asserted to work; they should be removed or given game-specific hook addresses before being advertised as supported.
-- Spatial positions are now captured when each sound event occurs instead of following the entity every frame. This avoids dereferencing destroyed entities and matches the event-position semantics usually desired for one-shot weapon sounds. Listener position and orientation are updated from the game camera (with a safe fallback if the camera matrix is unavailable), rather than sending a zero look direction to irrKlang. Test longer reload/melee samples in-game to decide whether entity-following should be restored with a safe entity-lifetime mechanism.
-- The AutoID3000 Mod Loader integration retains the original `fileCount - 1` convention because the supplied source does not document the export's count contract. Verify that API contract separately; if the count is the exact number of returned paths, this decrement would skip the final item.
-- The supplied archive contains `irrKlang.lib` and headers but not `irrKlang.dll`. The CI artifact is the compiled `.asi`; a runnable deployment must also provide the compatible 32-bit `irrKlang.dll` according to irrKlang's redistribution terms. The build pipeline intentionally does not fetch or redistribute that binary.
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 5 | 165-166 | `auto *weaponname = &string();` берёт адрес временного объекта, который уничтожается в конце оператора. Дальше в него пишут. Это UB и повреждение кучи. | Используются обычные локальные строки. |
+| 6 | 67-69 | `auto audiolocation = &audiostream->getPosition();`: `getPosition()` возвращает `vec3df` по значению, и указатель указывает на временный объект. | Позиция копируется в локальную переменную. |
+| 7 | 324 | `registerWeapon(&(folderroot / ...))`: адрес rvalue. Нестандартная конструкция, которую MSVC принимает как расширение. | Путь сохраняется в именованную переменную. |
+| 8 | 83-90 | `erase(0, rootlength)` без проверки длины строки. | `StripPrefix()` безопасно обрабатывает короткий путь. |
+| 9 | 54, 59-63, 105 | `CPhysical*`, сохранённый в списке звуков, может указывать на сущность, уже удалённую игрой. | **Не исправлено полностью.** Объекты GTA создаются из пулов с постоянной памятью, поэтому чтение не падает, но позиция может оказаться чужой. Полное решение: подписка на событие удаления сущности в Plugin-SDK. Не реализовано, потому что без SDK нельзя проверить имена событий. |
 
-## Automated build
+## Переполнение буфера
 
-`.github/workflows/build.yml` checks out Plugin-SDK, generates/builds its GTA SA static library, builds `EarShot.asi` with MSBuild, verifies the output exists, and uploads it as a GitHub Actions artifact. Run it from **Actions → Build EarShot (GTA San Andreas) → Run workflow**, or let it run on a push / pull request.
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 10 | 154 | `char weaponchar[255]; sprintf(weaponchar, "%s", ...)`: имя файла длиной 255 символов переполняет буфер. | `std::string`, без `sprintf`. |
+| 11 | 169 | `char modelname[255]; sprintf(...)`, та же проблема. | То же. |
 
-## Verification status
+## Ошибки логики и падения
 
-- Source archive and Visual Studio project structure inspected.
-- Visual Studio project XML parsed successfully after edits.
-- The workflow YAML structure parsed successfully; the configured GTA SA import library matches Plugin-SDK's documented `output/lib/plugin.lib` artifact.
-- Static checks confirmed the sound-handle `drop()` paths, hook cleanup, and fallback flow are present; this is not a substitute for compiler or runtime testing.
-- A Windows/MSVC build has **not** been executed in this environment; the first GitHub Actions run is the definitive compiler/linker check.
-- Runtime verification still requires launching the mod in the intended GTA SA version and testing custom WAV success/fallback, pausing, rapid-fire loads, shutdown, and repeated startup/shutdown.
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 12 | 170-172 | `modelfound` инициализируется нулём. Если `GetModelInfo` не нашёл модель и не записал индекс, `0 > -1` истинно, и звук привязывается к модели 0. | Переменная инициализируется `-1`, принимаются только индексы `>= 0`. |
+| 285-287 | `createIrrKlangDevice()` может вернуть `nullptr` (нет аудиоустройства). Тогда `setRolloffFactor` падает при инициализации RW. | Проверка на `nullptr`, при отсутствии движка мод сообщает об ошибке и не работает. |
+| 244, 259-261 | `thispointer->m_pPed` и `ped` не проверяются на `nullptr`. | Проверки добавлены. |
+| 257 | Закомментированный фрагмент `//&&` в условии. | Удалён. |
+| 306 | `recursive_directory_iterator` без `error_code` бросает исключение внутри обработчика событий игры. | Вариант с `error_code`. |
+| 280 | `create_directories` может бросить исключение при старте. | Вариант с `error_code`. |
+| 118-127 | Для каждого выстрела три проверки `fs::exists`. | Удалено: файлы разрешаются один раз и кешируются. |
+| 298, 95 | `MessageBox` при каждом неудачном воспроизведении: при сломанном файле игра заваливается модальными окнами. | Ошибка пишется в лог, файл помечается как недоступный и больше не пробуется. |
+| 295, 350-352 | Регистрация обработчиков `Events::gameProcessEvent`, `onPauseAllSounds` и `onResumeAllSounds` внутри обработчика того же события. Изменение списка обработчиков во время его обхода может привести к UB. | Все обработчики регистрируются один раз в конструкторе. |
+| 352 | `setAllSoundsPaused` вызывался каждый кадр, даже без изменений. | Вызов только при изменении состояния. |
+
+## Хуки и производительность
+
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 13 | 218, 232, 248, 265 | В каждом вызове хука снимается и заново ставится патч (`subhook_remove` / `subhook_install`). Каждая операция меняет защиту страниц памяти игры (`VirtualProtect`). Это горячий путь: удары и взмахи срабатывают часто. | Оригинал вызывается через `subhook_get_trampoline()`. Патч не меняется во время игры. |
+| 14 | 249, 266 | Оригинальные методы вызывались по захардкоженным адресам, в обход хука. | Вызов через трамплин, как выше. |
+| 15 | 41-52, 27-39 | `caseLower` / `caseUpper` строят строку посимвольно и передают `char` в `tolower()` без приведения к `unsigned char`. | Преобразование на месте, только ASCII. |
+| 16 | 137, 184 | `std::string` создаётся на каждый вызов `findWeapon`, потому что параметр передаётся по значению. | Имя действия - константа, строки не создаются на горячем пути. |
+
+## Кодировка путей
+
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 19 | 93, 117-126 | Путь передавался irrKlang через `path.string()`, то есть узкой строкой в ANSI-кодовой странице. Для путей с символами вне этой страницы файл не открывался, звук не играл. | Файл читается через `std::filesystem` (wide API) и передаётся в irrKlang через `addSoundSourceFromMemory`. Имя источника ASCII-шное (`EarShot/N.wav`), нужно только для расширения. Источники кешируются по файлу. |
+
+## Совместимость и сборка
+
+| # | Где | Проблема | Исправление |
+|---|-----|----------|-------------|
+| 17 | 340-343 | Адреса хуков - адреса San Andreas 1.0 (US). Конфигурации `GTAVC` и `GTA3` компилируют тот же код, и `jmp` записался бы в чужой код. | `#error`, если не определён `GTASA`. Сборка VC и III теперь останавливается, вместо того чтобы повредить игру. |
+| 18 | `.vcxproj` | Конфигурация `v141_xp` требует набор инструментов, которого может не быть на CI. | В workflow есть проверка и откат на v142 с предупреждением. |
+
+## Поведение, которое изменилось
+
+1. **Ошибка воспроизведения.** Раньше: модальное окно и подавлен звук игры. Теперь: запись в лог, и игра проигрывает свой звук.
+2. **Новые `.wav` в работающей игре.** Раньше файлы проверялись на каждый выстрел, и новые подхватывались сразу. Теперь набор файлов фиксируется при первом использовании. Новые файлы появятся после перезапуска игры. Цена: проверка диска на каждый выстрел убрана.
+3. **Конфигурации VC и III.** Не собираются (см. пункт 17).
+4. **Синхронизация паузы.** Вызов по изменению состояния, а не каждый кадр. Итоговое поведение то же, кроме редкого случая «звук начался во время меню»: раньше его перепаузило на следующем кадре.
+
+## Что проверено и как
+
+- `tests/core_test.cpp` тестирует `EarShotCore.h` на Linux с AddressSanitizer, UndefinedBehaviourSanitizer и LeakSanitizer. Тесты покрывают владение звуками (каждый дескриптор освобождён один раз, утечек нет), кеш источников, разбор имён, затухание громкости (совпадает с исходной формулой `pow(x, 6)`) и безопасную обрезку путей. Все проверки проходят.
+- `EarShot.cpp` проверен синтаксически с `-Wall -Wextra` на настоящих заголовках irrKlang и subhook из архива. Заголовки Plugin-SDK в архив не входят, поэтому типы GTA заменены заглушками. Это проверка синтаксиса и типов, но не линковки.
+
+## Что не проверено
+
+- **Компиляция против настоящего Plugin-SDK и запуск в игре.** Нужна сборка через GitHub Actions или Visual Studio и тест в игре.
+- **Поведение хуков-трамплинов в реальной игре.** Логика в тестах не покрывает subhook.
+- **Адреса хуков.** Взяты из исходного кода мода и не перепроверялись.
+- **Кириллица в irrKlang.** Чтение файла с путём на кириллице проверено отдельно. Что irrKlang корректно декодирует WAV из памяти, в игре не проверено. Цена решения: каждый звук целиком держится в памяти (копия внутри irrKlang).
+- **Имя `irrKlang.dll`.** Библиотека нужна рантайму и не входит в архив. Workflow подхватывает её, если положить файл по указанному пути.
