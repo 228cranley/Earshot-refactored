@@ -1,6 +1,6 @@
 # Re-EarShot
 
-Re-EarShot — это переработанная версия оригинального плагина EarShot для GTA San Andreas, созданная на основе NextGen Weapon Sounds.
+Re-EarShot — это переработанная версия оригинального плагина EarShot для GTA San Andreas.
 
 Проект направлен на улучшение исходного кода, исправление ошибок, улучшение управления памятью и упрощение использования пользовательских звуков оружия.
 
@@ -11,7 +11,7 @@ Re-EarShot — это переработанная версия оригинал
 - Улучшена инициализация игровых событий.
 
 ## Установка
-1. Скачайте `EarShot.asi` со страницы [Releases](../../releases)и поместите `EarShot.asi` в корневую папку GTA San Andreas, рядом с `gta_sa.exe`.
+1. Скачайте `EarShot.asi` со страницы [Releases](../../releases) и поместите `EarShot.asi` в корневую папку GTA San Andreas, рядом с `gta_sa.exe`.
 2. Создайте папку `EarShot` в корневой папке игры.
 3. Скачайте 32-битную версию irrKlang 1.6. и поместите в ту же папку, где находится `gta_sa.exe`.
 
@@ -70,7 +70,7 @@ Re-EarShot — неофициальная пользовательская мо�
 
 ------------------------------------------------------------------------------------------
 
-Re-EarShot is a refactored version of the original EarShot plugin for GTA San Andreas, based on NextGen Weapon Sounds.
+Re-EarShot is a refactored version of the original EarShot plugin for GTA San Andreas.
 
 The project focuses on improving the original code, fixing bugs, improving memory management, and making custom weapon sound replacement easier to use.
 
@@ -139,3 +139,5 @@ Restart the game after making changes.
 ## Disclaimer
 
 Re-EarShot is an unofficial community-made modification. Grand Theft Auto: San Andreas and all related trademarks belong to their respective owners.
+
+p.s я вайбкодил
